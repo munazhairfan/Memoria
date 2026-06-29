@@ -26,15 +26,16 @@ export default function DiaryPage() {
     const userMsgText = input.trim();
     setInput("");
     setLoading(true);
+    
+    const historyPayload = messages.map((m) => ({
+      role: m.role,
+      content: m.content,
+    }));
 
     const updatedMessages = [...messages, { role: "user" as const, content: userMsgText }];
     setMessages(updatedMessages);
 
     try {
-      const historyPayload = messages.map((m) => ({
-        role: m.role,
-        content: m.content,
-      }));
 
       const response = await fetch("http://127.0.0.1:8000/chat", {
         method: "POST",

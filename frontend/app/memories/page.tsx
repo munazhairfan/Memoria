@@ -35,7 +35,7 @@ function savePositions(nodes: Node[]) {
 export default function MemoriesPage() {
   const [nodes, setNodes, onNodesChange] = useNodesState([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState([]);
-  const [history, setHistory] = useState<string[]>([]);
+  const [history, setHistory] = useState<string>("");
   const [loading, setLoading] = useState(true);
 
   // Save positions whenever nodes are dragged
@@ -118,7 +118,22 @@ export default function MemoriesPage() {
 
         if (historyRes.ok) {
           const h = await historyRes.json();
-          setHistory(Array.isArray(h) ? h : h.history || []);
+          
+          // Get the raw string inside the array
+          const rawString = Array.isArray(h.history) ? h.history[0] : (h.history || "");
+          
+          // Use Regex to pull out exactly what's inside text="..."
+          const match = rawString.match(/text="([^"\\]*(?:\\.[^"\\]*)*)"/);
+          
+          if (match && match[1]) {
+            // If we found the clean text, save it to state
+            setHistory(match[1]);
+          } else if (rawString && !rawString.includes("kind='graph_completion'")) {
+            // Fallback if the backend suddenly sends a normal clean string
+            setHistory(rawString);
+          } else {
+            setHistory("No core memory snapshot extracted yet.");
+          }
         }
       } catch (err) {
         console.error(err);
@@ -159,15 +174,13 @@ export default function MemoriesPage() {
       </div>
 
       <div className="p-6 max-w-4xl mx-auto bg-white border-t w-full">
-        <h2 className="font-bold text-lg mb-4">History</h2>
-        {history.length === 0 ? (
-          <p className="text-slate-400">No memories yet.</p>
+        <h2 className="font-bold text-lg mb-4">Core Profile Memory Summary</h2>
+        {!history ? (
+          <p className="text-slate-400">No core memory snapshot extracted yet.</p>
         ) : (
-          history.map((item, i) => (
-            <div key={i} className="mb-4 p-5 bg-slate-50 border rounded-2xl text-slate-700">
-              {item}
-            </div>
-          ))
+          <div className="mb-4 p-5 bg-indigo-50 border border-indigo-100 rounded-2xl text-indigo-950 text-base leading-relaxed shadow-sm">
+            {history}
+          </div>
         )}
       </div>
     </div>

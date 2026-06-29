@@ -3,7 +3,7 @@
 # CRITICAL: This must be the absolute first import to enforce matching paths across all execution threads!
 from config import init_config
 init_config()
-
+from datetime import datetime
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -14,7 +14,6 @@ import os
 from cognee_client import remember, recall
 import json as _json
 from pathlib import Path as _Path
-
 from contextlib import asynccontextmanager
 
 @asynccontextmanager
@@ -84,6 +83,7 @@ async def _extract_and_store_triples(text: str, memories: list[str]):
 
         context = "\n".join(memories) if memories else text
         prompt = f"""Extract knowledge graph triples from the following diary memory.
+CRITICAL: Ensure temporal data (dates, time frames mentioned, or the date of the entry) is explicitly captured. Link events, projects, and feelings to their respective dates or periods.
 Return ONLY a JSON array of objects with keys: subject, relationship, object.
 No explanation, no markdown, just the raw JSON array.
 
@@ -138,12 +138,16 @@ async def create_entry(body: EntryRequest):
         if not body.text.strip():
             raise HTTPException(status_code=400, detail="Entry text must not be empty.")
 
-        await remember(body.text)
+        current_date = datetime.now().strftime("%B %d, %Y")
+        # Structure the text with a clear time anchor
+        time_anchored_text = f"On {current_date}: {body.text}"
+
+        await remember(time_anchored_text)
 
         # Extract real triples from this entry and store in graph
         try:
             memories = await recall(body.text)
-            await _extract_and_store_triples(body.text, memories)
+            await _extract_and_store_triples(time_anchored_text, memories)
         except Exception:
             pass  # Don't fail the entry if graph extraction fails
 
@@ -187,6 +191,43 @@ async def get_graph():
         print(f"--> [Graph error]: {e}")
         return {"nodes": [], "edges": []}
     
+@app.delete("/graph/node/{node_id}")
+async def delete_node(node_id: str):
+    try:
+        # 1. Delete from local visualization graph
+        g = _load_graph()
+        
+        # Remove node
+        node_label_to_remove = None
+        for label, nid in list(g["nodes"].items()):
+            if str(nid) == str(node_id):
+                node_label_to_remove = label
+                del g["nodes"][label]
+                break
+
+        # Remove connected edges
+        g["edges"] = [e for e in g["edges"] if str(e.get("source")) != str(node_id) and str(e.get("target")) != str(node_id)]
+
+        _save_graph(g)
+
+        # 2. Delete from real Cognee memory
+        try:
+            import cognee
+            if node_label_to_remove:
+                await cognee.delete(entity_name=node_label_to_remove)
+            else:
+                # Fallback delete by ID if label not found
+                from cognee.infrastructure.databases.graph import get_graph_engine
+                graph_engine = await get_graph_engine()
+                await graph_engine.delete_node(node_id)
+        except Exception as cognee_err:
+            print(f"--> Cognee delete warning: {cognee_err}")
+
+        return {"status": "success", "message": f"Node {node_id} deleted from both visualization and permanent memory."}
+
+    except Exception as e:
+        print(f"Delete error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 class ChatMessage(BaseModel):
     role: str
@@ -230,7 +271,12 @@ TOOLS = [
 
 
 SYSTEM_PROMPT = """You are Memoria, a warm and thoughtful AI diary companion. You help users reflect on their life by remembering what they share and recalling memories when asked. You speak like a caring friend, not an assistant. Keep responses concise — 2-3 sentences max.
-CRITICAL: When choosing to use a tool function, output ONLY valid JSON arguments inside the structural call. Do not append extra brackets or loose text outside the parameter schema."""
+
+Only use the remember_entry tool when the user shares something meaningful about their life — feelings, events, experiences, achievements, preferences, or personal updates. Do NOT use remember_entry for casual questions, greetings, small talk, or anything that is not a personal diary-worthy thought.
+
+Only use recall_memory when the user is explicitly asking about something from their past.
+
+For everything else, just respond conversationally without using any tool."""
 
 
 @app.post("/chat")
@@ -301,7 +347,11 @@ async def chat(body: ChatRequest):
         # Step 3a: remember_entry pipeline route
         if fn_name == "remember_entry":
             text = fn_args["text"]
-            await remember(text)
+            current_date = datetime.now().strftime("%B %d, %Y")
+            time_anchored_text = f"On {current_date}: {text}"
+            
+            # Save the time-anchored memory to Cognee
+            await remember(time_anchored_text)
 
             follow_up = messages + [
                 assistant_msg,
@@ -309,7 +359,7 @@ async def chat(body: ChatRequest):
                     "role": "tool",
                     "tool_call_id": tool_id,
                     "name": fn_name,
-                    "content": f"Memory saved successfully: '{text}'"
+                    "content": f"Memory saved successfully: '{time_anchored_text}'"
                 },
                 {
                     "role": "user",
@@ -386,10 +436,33 @@ async def chat(body: ChatRequest):
 @app.get("/history")
 async def get_history():
     try:
-        results = await recall("diary entry today activity feelings event project")
+        results = await recall("User long-term memory profile, permanent facts, core timeline, life events, and chronological summary.")
+        
+        cleaned_results = []
+        if results and isinstance(results, list):
+            for item in results:
+                # If Cognee leaks its internal Python class string representation
+                if isinstance(item, str) and "kind='graph_completion'" in item:
+                    try:
+                        # Extract what is inside text="..."
+                        if 'text="' in item:
+                            # Split at text=" and grab everything before the next attribute quote
+                            text_part = item.split('text="')[1].split('" score=')[0]
+                            # Unescape internal quotes if any exist
+                            text_part = text_part.replace('\\"', '"')
+                            cleaned_results.append(text_part)
+                        else:
+                            cleaned_results.append(item)
+                    except Exception:
+                        cleaned_results.append(item) # Fallback to raw item if split fails
+                else:
+                    cleaned_results.append(item)
+        else:
+            cleaned_results = results
+
         from fastapi.responses import JSONResponse
         return JSONResponse(
-            content={"history": results},
+            content={"history": cleaned_results},
             headers={"Cache-Control": "no-store, no-cache", "Pragma": "no-cache"}
         )
     except Exception as e:
