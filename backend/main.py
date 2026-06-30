@@ -147,6 +147,7 @@ async def create_entry(body: EntryRequest):
         # Extract real triples from this entry and store in graph
         try:
             memories = await recall(body.text)
+            memories = list(dict.fromkeys(memories))
             await _extract_and_store_triples(time_anchored_text, memories)
         except Exception:
             pass  # Don't fail the entry if graph extraction fails
@@ -191,44 +192,6 @@ async def get_graph():
         print(f"--> [Graph error]: {e}")
         return {"nodes": [], "edges": []}
     
-@app.delete("/graph/node/{node_id}")
-async def delete_node(node_id: str):
-    try:
-        # 1. Delete from local visualization graph
-        g = _load_graph()
-        
-        # Remove node
-        node_label_to_remove = None
-        for label, nid in list(g["nodes"].items()):
-            if str(nid) == str(node_id):
-                node_label_to_remove = label
-                del g["nodes"][label]
-                break
-
-        # Remove connected edges
-        g["edges"] = [e for e in g["edges"] if str(e.get("source")) != str(node_id) and str(e.get("target")) != str(node_id)]
-
-        _save_graph(g)
-
-        # 2. Delete from real Cognee memory
-        try:
-            import cognee
-            if node_label_to_remove:
-                await cognee.delete(entity_name=node_label_to_remove)
-            else:
-                # Fallback delete by ID if label not found
-                from cognee.infrastructure.databases.graph import get_graph_engine
-                graph_engine = await get_graph_engine()
-                await graph_engine.delete_node(node_id)
-        except Exception as cognee_err:
-            print(f"--> Cognee delete warning: {cognee_err}")
-
-        return {"status": "success", "message": f"Node {node_id} deleted from both visualization and permanent memory."}
-
-    except Exception as e:
-        print(f"Delete error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
 class ChatMessage(BaseModel):
     role: str
     content: str
@@ -353,6 +316,13 @@ async def chat(body: ChatRequest):
             # Save the time-anchored memory to Cognee
             await remember(time_anchored_text)
 
+            try:
+                memories = await recall(text)
+                memories = list(dict.fromkeys(memories))
+                await _extract_and_store_triples(time_anchored_text, memories, source_memory=time_anchored_text)
+            except Exception:
+                pass  # don't fail the chat reply if graph extraction fails
+
             follow_up = messages + [
                 assistant_msg,
                 {
@@ -363,7 +333,7 @@ async def chat(body: ChatRequest):
                 },
                 {
                     "role": "user",
-                    "content": "Please respond warmly confirming what you just remembered."
+                    "content": "Answer my question conversationally using those memories. If a memory includes a date prefix like 'On [date]:', state that date explicitly in your answer."
                 }
             ]
             r2 = await client.chat.completions.create(
