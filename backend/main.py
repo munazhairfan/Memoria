@@ -1,40 +1,55 @@
-# backend/main.py
-
 # CRITICAL: This must be the absolute first import to enforce matching paths across all execution threads!
-from config import init_config
+# uvicorn backend.main:app --reload
+from backend.config import init_config
 init_config()
 from datetime import datetime
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
 import uvicorn
 import cognee
 import os
-from cognee_client import remember, recall
+from backend.cognee_client import remember, recall
 import json as _json
 from pathlib import Path as _Path
 from contextlib import asynccontextmanager
+from backend.routers.conversations import router as conversations_router
+from backend.routers.auth import router as auth_router
+from bson import ObjectId
+from datetime import datetime, timezone
+from backend.database import conversations, messages, users   # Make sure this line exists
+from backend.models import ChatRequest
+from backend.auth import get_current_user_id
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup: silently build graph from existing memories if no graph file yet
-    if not GRAPH_FILE.exists():
-        try:
-            topics = ["diary entry", "activity", "project", "people", "places", "feelings"]
-            all_memories = []
-            for topic in topics:
-                try:
-                    results = await recall(topic)
-                    all_memories.extend(results)
-                except Exception:
-                    pass
-            seen = set()
-            unique = [m for m in all_memories if not (m in seen or seen.add(m))]
-            if unique:
-                await _extract_and_store_triples("backfill", unique)
-        except Exception as e:
-            print(f"--> [Startup backfill error]: {e}")
+    # Startup: silently build each registered user's graph from their existing
+    # memories if they don't have one yet. recall() is now scoped to each
+    # user's own Cognee dataset (see cognee_client.py), so this backfill only
+    # ever pulls that user's own memories.
+    try:
+        async for user in users.find({}):
+            uid = str(user["_id"])
+            if _graph_file(uid).exists():
+                continue
+            try:
+                topics = ["diary entry", "activity", "project", "people", "places", "feelings"]
+                all_memories = []
+                for topic in topics:
+                    try:
+                        results = await recall(topic, uid)
+                        all_memories.extend(results)
+                    except Exception:
+                        pass
+                seen = set()
+                unique = [m for m in all_memories if not (m in seen or seen.add(m))]
+                if unique:
+                    await _extract_and_store_triples(uid, "backfill", unique)
+            except Exception as e:
+                print(f"--> [Startup backfill error for user {uid}]: {e}")
+    except Exception as e:
+        print(f"--> [Startup backfill error]: {e}")
     yield  # App runs here
 
 app = FastAPI(
@@ -52,6 +67,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+app.include_router(conversations_router)
+app.include_router(auth_router)
 
 # ── Schemas ────────────────────────────────────────────────────────────────
 
@@ -63,29 +80,66 @@ class QueryRequest(BaseModel):
 
 # Helper function
 
-GRAPH_FILE = _Path(__file__).parent / "memory_graph.json"
+GRAPH_DIR = _Path(__file__).parent / "graphs"
+GRAPH_DIR.mkdir(exist_ok=True)
 
-def _load_graph() -> dict:
-    if GRAPH_FILE.exists():
+# FIX: this used to be one hardcoded GRAPH_FILE shared by every user — every
+# user's extracted people/places/events were mixed into a single file that
+# anyone with a valid token could read via /graph. Now scoped per user_id.
+def _graph_file(user_id: str) -> _Path:
+    safe_id = "".join(c for c in user_id if c.isalnum() or c in "-_")
+    return GRAPH_DIR / f"memory_graph_{safe_id}.json"
+
+def _load_graph(user_id: str) -> dict:
+    path = _graph_file(user_id)
+    if path.exists():
         try:
-            return _json.loads(GRAPH_FILE.read_text())
+            return _json.loads(path.read_text())
         except Exception:
             pass
     return {"nodes": {}, "edges": []}  # nodes = {label: id}
 
-def _save_graph(g: dict):
-    GRAPH_FILE.write_text(_json.dumps(g))
+def _save_graph(user_id: str, g: dict):
+    _graph_file(user_id).write_text(_json.dumps(g))
 
-async def _extract_and_store_triples(text: str, memories: list[str]):
+def _search_graph_triples(user_id: str, query: str) -> list[str]:
+    # FIX: recall_memory (used by /chat) previously only ever queried
+    # Cognee's live semantic chunk search, which can miss short factual
+    # details (dates, names) that chunk-similarity ranking doesn't surface
+    # well — even when that exact fact is sitting in the graph the user can
+    # see on /memories. Triple extraction already has a fallback to raw
+    # entry text (see _extract_and_store_triples below), which is why the
+    # graph reliably has facts that live chat recall sometimes misses. This
+    # gives chat recall the same safety net: a plain keyword match over the
+    # user's own stored (subject, relationship, object) triples.
+    g = _load_graph(user_id)
+    STOPWORDS = {"user", "the", "and", "was", "that", "this", "did", "does",
+                 "have", "has", "with", "for", "about", "know", "when", "what"}
+    terms = [t.lower() for t in query.split() if len(t) > 2 and t.lower() not in STOPWORDS]
+    if not terms:
+        return []
+    hits = []
+    for e in g.get("edges", []):
+        subj, rel, obj = e.get("subj", ""), e.get("label", ""), e.get("obj", "")
+        haystack = f"{subj} {rel} {obj}".lower()
+        if any(term in haystack for term in terms):
+            hits.append(f"{subj} {rel} {obj}")
+    return hits
+
+async def _extract_and_store_triples(user_id: str, text: str, memories: list[str], source_memory: str = None):
     try:
         from groq import AsyncGroq
         client = AsyncGroq(api_key=os.environ["LLM_API_KEY"])
 
         context = "\n".join(memories) if memories else text
-        prompt = f"""Extract knowledge graph triples from the following diary memory.
-CRITICAL: Ensure temporal data (dates, time frames mentioned, or the date of the entry) is explicitly captured. Link events, projects, and feelings to their respective dates or periods.
-Return ONLY a JSON array of objects with keys: subject, relationship, object.
-No explanation, no markdown, just the raw JSON array.
+        prompt = f"""Extract knowledge graph triples from the diary entry below.
+
+CRITICAL RULES:
+- ALWAYS capture temporal information: dates, times, "on [date]", "last week", "in June", etc.
+- Create explicit triples linking events to their dates.
+- Use relationship names like: "happened_on", "occurred_on", "scheduled_for", "took_place_in", "mentioned_date".
+
+Return ONLY a valid JSON array of objects. No explanation, no markdown.
 
 Memory:
 {context}"""
@@ -103,7 +157,7 @@ Memory:
                 raw = raw[4:]
         triples = _json.loads(raw.strip())
 
-        g = _load_graph()
+        g = _load_graph(user_id)
         for t in triples:
             subj = str(t.get("subject", "")).strip()
             rel  = str(t.get("relationship", "")).strip()
@@ -123,13 +177,13 @@ Memory:
                 "subj": subj,
                 "obj": obj
             })
-        _save_graph(g)
+        _save_graph(user_id, g)
     except Exception as e:
         print(f"--> [Graph extraction error]: {e}")
 # ── Routes ─────────────────────────────────────────────────────────────────
 
 @app.post("/entry")
-async def create_entry(body: EntryRequest):
+async def create_entry(body: EntryRequest, user_id: str = Depends(get_current_user_id)):
     """
     Save a diary entry into Cognee's graph memory.
     This also builds the LanceDB vector schema if it doesn't exist yet.
@@ -142,13 +196,13 @@ async def create_entry(body: EntryRequest):
         # Structure the text with a clear time anchor
         time_anchored_text = f"On {current_date}: {body.text}"
 
-        await remember(time_anchored_text)
+        await remember(time_anchored_text, user_id)
 
         # Extract real triples from this entry and store in graph
         try:
-            memories = await recall(body.text)
+            memories = await recall(body.text, user_id)
             memories = list(dict.fromkeys(memories))
-            await _extract_and_store_triples(time_anchored_text, memories)
+            await _extract_and_store_triples(user_id, time_anchored_text, memories, source_memory=time_anchored_text)
         except Exception:
             pass  # Don't fail the entry if graph extraction fails
 
@@ -160,7 +214,7 @@ async def create_entry(body: EntryRequest):
 
 
 @app.post("/query")
-async def query_memory(body: QueryRequest):
+async def query_memory(body: QueryRequest, user_id: str = Depends(get_current_user_id)):
     """
     Query Cognee's graph memory for relevant diary entries.
     Returns an empty list if no entries have been saved yet,
@@ -170,8 +224,10 @@ async def query_memory(body: QueryRequest):
         if not body.query.strip():
             raise HTTPException(status_code=400, detail="Query must not be empty.")
 
-        results = await recall(body.query)
-        return {"answer": results}
+        results = await recall(body.query, user_id)
+        graph_hits = _search_graph_triples(user_id, body.query)
+        combined = list(dict.fromkeys([*results, *graph_hits]))
+        return {"answer": combined}
     except HTTPException:
         raise
     except Exception as e:
@@ -182,23 +238,20 @@ async def query_memory(body: QueryRequest):
 
 
 @app.get("/graph")
-async def get_graph():
+async def get_graph(user_id: str = Depends(get_current_user_id)):
     try:
-        g = _load_graph()
+        g = _load_graph(user_id)
         nodes = [{"id": nid, "label": label} for label, nid in g["nodes"].items()]
         edges = [{"source": e["source"], "target": e["target"], "label": e["label"]} for e in g["edges"]]
         return {"nodes": nodes, "edges": edges}
     except Exception as e:
         print(f"--> [Graph error]: {e}")
         return {"nodes": [], "edges": []}
-    
+
 class ChatMessage(BaseModel):
     role: str
     content: str
 
-class ChatRequest(BaseModel):
-    message: str
-    history: list[ChatMessage] = []
 
 
 TOOLS = [
@@ -220,7 +273,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "recall_memory",
-            "description": "Search the user's past memories to answer a question about their history.",
+            "description": "Check the user's stored memories/diary history before answering any question about something they may have told you before — dates, names, facts, past events, decisions, feelings, anything. Call this whenever there's a reasonable chance the answer already exists in memory, even if the user's phrasing is indirect (e.g. 'do you know...', 'did I mention...', 'what was it again...'). It is always better to check memory first than to answer from guesswork.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -235,179 +288,246 @@ TOOLS = [
 
 SYSTEM_PROMPT = """You are Memoria, a warm and thoughtful AI diary companion. You help users reflect on their life by remembering what they share and recalling memories when asked. You speak like a caring friend, not an assistant. Keep responses concise — 2-3 sentences max.
 
-Only use the remember_entry tool when the user shares something meaningful about their life — feelings, events, experiences, achievements, preferences, or personal updates. Do NOT use remember_entry for casual questions, greetings, small talk, or anything that is not a personal diary-worthy thought.
+Call remember_entry whenever the user's message contains ANY personal fact, preference, feeling, opinion, event, or experience about themselves — even if it's only one sentence inside an otherwise casual message, and even if they also asked you something. Extract and save just the personal part as the "text" argument; you can still answer the rest of the message conversationally in your reply.
 
-Only use recall_memory when the user is explicitly asking about something from their past.
+Examples that SHOULD trigger remember_entry:
+- "I really like chocolate, what's your favorite?" -> save "User really likes chocolate"
+- "Ugh, work was exhausting today, anyway what's the weather like?" -> save "User found work exhausting today"
+- "My sister's getting married in June" -> save the whole thing
+- "When did I last see my friend Alex? I think it was in March." -> save "User last saw their friend Alex in March"
+
+Examples that should NOT trigger remember_entry — no personal content at all:
+- "hey", "how are you", "what can you do", "can you help me with something"
+
+Call recall_memory whenever the user asks about something you might already know from their memories — not just direct questions like "when did I...", but also indirect ones like "do you know...", "did I ever mention...", "what was it again", or "do you remember X". If there's a reasonable chance the answer is already stored, check before answering — don't rely on what's just in this conversation so far.
+
+Examples that SHOULD trigger recall_memory:
+- "When did I start my business?"
+- "Do you know the date?" (following an earlier conversation about an event)
+- "Did I ever tell you my sister's name?"
+- "What did I say I wanted to do this weekend?"
+
+Examples that should NOT trigger recall_memory — nothing to look up:
+- "What's the weather like?", "What can you do?", general chit-chat with no reference to the user's own past
 
 For everything else, just respond conversationally without using any tool."""
 
 
+async def _safe_completion_with_tools(client, messages_list):
+    """
+    Groq's Llama tool-calling occasionally emits a malformed pseudo-function
+    call (e.g. literal "<function=...>" text) instead of a properly
+    structured tool call, and the API rejects it with a 400 tool_use_failed
+    error. Retry once with tools enabled — this is often just a one-off
+    generation flake — then fall back to a tool-less completion so a single
+    bad generation doesn't crash the whole request and lose the user's
+    message entirely.
+    """
+    for attempt in range(2):
+        try:
+            return await client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=messages_list,
+                tools=TOOLS,
+                tool_choice="auto",
+            )
+        except Exception as e:
+            err_str = str(e)
+            if "tool_use_failed" not in err_str and "Failed to call a function" not in err_str:
+                raise
+            print(f"⚠️ Tool call generation failed (attempt {attempt + 1}/2): {err_str}")
+
+    print("⚠️ Falling back to a tool-less response after repeated tool_use_failed errors")
+    return await client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=messages_list,
+        tool_choice="none",
+    )
+
+
 @app.post("/chat")
-async def chat(body: ChatRequest):
+async def chat(body: ChatRequest, user_id: str = Depends(get_current_user_id)):
     try:
         import json
         import re
         from groq import AsyncGroq
+        from datetime import datetime, timezone
+        from bson import ObjectId
 
         client = AsyncGroq(api_key=os.environ.get("LLM_API_KEY"))
 
-        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        messages_list = [{"role": "system", "content": SYSTEM_PROMPT}]
         for msg in body.history:
-            messages.append({"role": msg.role, "content": msg.content})
-        messages.append({"role": "user", "content": body.message})
+            # Check if it's a dict or an object to be absolutely bulletproof
+            if isinstance(msg, dict):
+                messages_list.append({"role": msg.get("role"), "content": msg.get("content")})
+            else:
+                messages_list.append({"role": msg.role, "content": msg.content})
 
-        response = await client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=messages,
-            tools=TOOLS,
-            tool_choice="auto",
-        )
+        messages_list.append({"role": "user", "content": body.message})
+
+
+        response = await _safe_completion_with_tools(client, messages_list)
 
         choice = response.choices[0]
+        reply = choice.message.content or "I'm not sure how to respond."
+        action = "chat"
 
-        # Standard clean execution path
+        # Handle Tool Calls (remember / recall)
         if choice.message.tool_calls:
             tool_call = choice.message.tool_calls[0]
             fn_name = tool_call.function.name
             fn_args = json.loads(tool_call.function.arguments)
             tool_id = tool_call.id
-        else:
-            # --- ROBUST LLM STRING-FALLBACK PARSING LAYER ---
-            # If Groq emits a 400 because it hallucinates tags directly into text content:
-            content_str = choice.message.content or ""
-            
-            if "recall_memory" in content_str:
-                fn_name = "recall_memory"
-                tool_id = "fallback_id_recall"
-                # Match everything inside the arguments block dynamically
-                query_match = re.search(r'"query":\s*"([^"\\]*(?:\\.[^"\\]*)*)"', content_str)
-                fn_args = {"query": query_match.group(1) if query_match else body.message}
-            elif "remember_entry" in content_str:
-                fn_name = "remember_entry"
-                tool_id = "fallback_id_remember"
-                text_match = re.search(r'"text":\s*"([^"\\]*(?:\\.[^"\\]*)*)"', content_str)
-                fn_args = {"text": text_match.group(1) if text_match else body.message}
-            else:
-                # No regular text formatting anomalies; treat as plain chat
-                return {"reply": content_str, "action": "chat"}
 
-        # Build a safe helper dictionary context for Groq's conversational history array
-        assistant_msg = {
-            "role": "assistant",
-            "content": choice.message.content if choice.message.content else None,
-            "tool_calls": [
-                {
-                    "id": tool_id,
-                    "type": "function",
-                    "function": {
-                        "name": fn_name,
-                        "arguments": json.dumps(fn_args)
-                    }
-                }
-            ] if tool_id != "fallback_id" else None
-        }
+            if fn_name == "remember_entry":
+                text = fn_args["text"]
+                current_date = datetime.now().strftime("%B %d, %Y")
+                time_anchored_text = f"On {current_date}: {text}"
 
-        # Step 3a: remember_entry pipeline route
-        if fn_name == "remember_entry":
-            text = fn_args["text"]
-            current_date = datetime.now().strftime("%B %d, %Y")
-            time_anchored_text = f"On {current_date}: {text}"
-            
-            # Save the time-anchored memory to Cognee
-            await remember(time_anchored_text)
+                await remember(time_anchored_text, user_id)
+                try:
+                    memories = await recall(text, user_id)
+                    memories = list(dict.fromkeys(memories))
+                    await _extract_and_store_triples(user_id, time_anchored_text, memories, source_memory=time_anchored_text)
+                except:
+                    pass
 
-            try:
-                memories = await recall(text)
-                memories = list(dict.fromkeys(memories))
-                await _extract_and_store_triples(time_anchored_text, memories, source_memory=time_anchored_text)
-            except Exception:
-                pass  # don't fail the chat reply if graph extraction fails
+                follow_up = messages_list + [
+                    {
+                        "role": "assistant",
+                        "content": choice.message.content,
+                        "tool_calls": [
+                            {
+                                "id": tool_call.id,
+                                "type": "function",
+                                "function": {
+                                    "name": tool_call.function.name,
+                                    "arguments": tool_call.function.arguments,
+                                },
+                            }
+                        ],
+                    },
+                    {"role": "tool", "tool_call_id": tool_id, "name": fn_name, "content": f"Memory saved: {time_anchored_text}"},
+                    {"role": "user", "content": "Answer my question conversationally using those memories."}
+                ]
+                r2 = await client.chat.completions.create(model="llama-3.3-70b-versatile", messages=follow_up, temperature=0)
+                reply = r2.choices[0].message.content
+                action = "remember"
 
-            follow_up = messages + [
-                assistant_msg,
-                {
-                    "role": "tool",
-                    "tool_call_id": tool_id,
-                    "name": fn_name,
-                    "content": f"Memory saved successfully: '{time_anchored_text}'"
-                },
-                {
-                    "role": "user",
-                    "content": "Answer my question conversationally using those memories. If a memory includes a date prefix like 'On [date]:', state that date explicitly in your answer."
-                }
-            ]
-            r2 = await client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
-                messages=follow_up,
+            elif fn_name == "recall_memory":
+                query = fn_args["query"]
+                results = await recall(query, user_id)
+                graph_hits = _search_graph_triples(user_id, query)
+                # Combine both sources, de-duplicated — the graph catches
+                # specific facts that semantic chunk search sometimes misses.
+                combined = list(dict.fromkeys([*results, *graph_hits]))
+                context = "\n".join(combined) if combined else "No memories found."
+
+                # TEMP DEBUG: remove once recall reliability is confirmed.
+                # Shows exactly what the model searched for and what each
+                # source returned, so a failed lookup can be diagnosed from
+                # the server log instead of guessed at.
+                print(f"🔍 recall_memory query={query!r}")
+                print(f"🔍   cognee results ({len(results)}): {results}")
+                print(f"🔍   graph_hits ({len(graph_hits)}): {graph_hits}")
+
+                follow_up = messages_list + [
+                    {
+                        "role": "assistant",
+                        "content": choice.message.content,
+                        "tool_calls": [
+                            {
+                                "id": tool_call.id,
+                                "type": "function",
+                                "function": {
+                                    "name": tool_call.function.name,
+                                    "arguments": tool_call.function.arguments,
+                                },
+                            }
+                        ],
+                    },
+                    {"role": "tool", "tool_call_id": tool_id, "name": fn_name, "content": context},
+                    {"role": "user", "content": "The tool result above contains real facts retrieved from the user's memory — treat them as true and already established, not as something to second-guess. Answer my question directly using them. Only say you don't have the memory if the tool result is literally empty or truly unrelated to what I asked."}
+                ]
+                r2 = await client.chat.completions.create(model="llama-3.3-70b-versatile", messages=follow_up, temperature=0)
+                reply = r2.choices[0].message.content
+                action = "recall"
+
+        # === SAVE MESSAGES TO DATABASE ===
+        if body.conversationId:
+            conv_id = body.conversationId
+            db_conv_id = ObjectId(conv_id)
+
+            # FIX: previously this block wrote messages into whatever
+            # conversationId the client sent with zero ownership check — any
+            # authenticated user could pass another user's conversation id
+            # and have their messages saved into it. Verify ownership first,
+            # matching the same rule used in conversations.py, and do it
+            # BEFORE writing anything.
+            conv_doc = await conversations.find_one({
+                "_id": db_conv_id,
+                "$or": [
+                    {"user_id": user_id},
+                    {"user_id": {"$exists": False}}
+                ]
+            })
+            if not conv_doc:
+                raise HTTPException(status_code=403, detail="You don't have access to this conversation")
+
+            print(f"💾 Saving to conversation: {conv_id}")
+
+            # 1. Save user message using the proper ObjectId
+            await messages.insert_one({
+                "conversation_id": db_conv_id,
+                "role": "user",
+                "content": body.message,
+                "timestamp": datetime.now(timezone.utc)
+            })
+
+            # 2. Save assistant response using the proper ObjectId
+            await messages.insert_one({
+                "conversation_id": db_conv_id,
+                "role": "assistant",
+                "content": reply,
+                "action": action,
+                "timestamp": datetime.now(timezone.utc)
+            })
+
+            # 3. Update the timestamp and conditionally update the title
+            update_payload = {
+                "updated_at": datetime.now(timezone.utc)
+            }
+
+            # FIX: was matching a hardcoded list of placeholder strings
+            # ("New Chat Session" / "New Chat" / "" / None) that never matched
+            # the actual default title ("New Conversation") set in conversations.py,
+            # so the title never got renamed. Use an explicit title_set flag instead.
+            if conv_doc and not conv_doc.get("title_set", False):
+                update_payload["title"] = body.message[:25] + "..." if len(body.message) > 25 else body.message
+                update_payload["title_set"] = True
+
+            await conversations.update_one(
+                {"_id": db_conv_id},
+                {"$set": update_payload}
             )
-            return {"reply": r2.choices[0].message.content, "action": "remember"}
 
-        # Step 3b: recall_memory pipeline route
-        if fn_name == "recall_memory":
-            query = fn_args["query"]
-            results = await recall(query)
-            context = "\n".join(results) if results else "No memories found for that topic."
+            print(f"✅ Saved messages and updated attributes for {conv_id}")
 
-            follow_up = messages + [
-                assistant_msg,
-                {
-                    "role": "tool",
-                    "tool_call_id": tool_id,
-                    "name": fn_name,
-                    "content": context
-                },
-                {
-                    "role": "user",
-                    "content": "Answer my question conversationally using those memories."
-                }
-            ]
-            r2 = await client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
-                messages=follow_up,
-            )
-            return {"reply": r2.choices[0].message.content, "action": "recall"}
+        return {"reply": reply, "action": action}
 
-        return {"reply": choice.message.content or "I'm not sure how to respond to that.", "action": "chat"}
-
+    except HTTPException:
+        raise
     except Exception as e:
-        # Final catch-all structural extractor if the SDK errors out on tool parameters early
-        err_msg = str(e)
-        if "recall_memory" in err_msg:
-            try:
-                import re
-                # Dynamically extract whatever query the LLM actually tried to pass
-                query_match = re.search(r'"query":\s*"([^"]+)"', err_msg)
-                fallback_query = query_match.group(1) if query_match else body.message
-                
-                # Execute a clean database lookup using the actual query
-                results = await recall(fallback_query)
-                
-                if results:
-                    context = "\n".join(results)
-                    # Let a fast fallback completion provide the answer using the real context
-                    r2 = await client.chat.completions.create(
-                        model="llama-3.3-70b-versatile",
-                        messages=[
-                            {"role": "system", "content": SYSTEM_PROMPT},
-                            {"role": "user", "content": f"Context memories found:\n{context}\n\nAnswer the user's question: {body.message}"}
-                        ]
-                    )
-                    return {"reply": r2.choices[0].message.content, "action": "recall"}
-                else:
-                    return {
-                        "reply": f"I checked my notes for '{fallback_query}', but I don't have the specific details about that project written down yet. Could you remind me what it's called?",
-                        "action": "recall"
-                    }
-            except Exception:
-                pass
-        
-        raise HTTPException(status_code=500, detail={"error": str(e)})
+        print("Chat Error:", str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.get("/history")
-async def get_history():
+async def get_history(user_id: str = Depends(get_current_user_id)):
     try:
-        results = await recall("User long-term memory profile, permanent facts, core timeline, life events, and chronological summary.")
-        
+        results = await recall("User long-term memory profile, permanent facts, core timeline, life events, and chronological summary.", user_id)
+
         cleaned_results = []
         if results and isinstance(results, list):
             for item in results:
