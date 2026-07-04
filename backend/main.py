@@ -203,8 +203,10 @@ async def create_entry(body: EntryRequest, user_id: str = Depends(get_current_us
             memories = await recall(body.text, user_id)
             memories = list(dict.fromkeys(memories))
             await _extract_and_store_triples(user_id, time_anchored_text, memories, source_memory=time_anchored_text)
-        except Exception:
-            pass  # Don't fail the entry if graph extraction fails
+        except Exception as e:
+            # Was a bare `pass` — any failure here (recall() erroring,
+            # extraction failing) was completely invisible, no log at all.
+            print(f"--> [/entry graph extraction error] user={user_id}: {e}")
 
         return {"status": "saved"}
     except HTTPException:
@@ -390,8 +392,11 @@ async def chat(body: ChatRequest, user_id: str = Depends(get_current_user_id)):
                     memories = await recall(text, user_id)
                     memories = list(dict.fromkeys(memories))
                     await _extract_and_store_triples(user_id, time_anchored_text, memories, source_memory=time_anchored_text)
-                except:
-                    pass
+                except Exception as e:
+                    # Was a bare `except: pass` — completely silent on
+                    # failure. This is the block responsible for updating
+                    # the graph every time something new gets remembered.
+                    print(f"--> [/chat remember_entry graph extraction error] user={user_id}: {e}")
 
                 follow_up = messages_list + [
                     {

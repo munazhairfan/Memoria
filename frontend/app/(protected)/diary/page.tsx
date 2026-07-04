@@ -16,6 +16,13 @@ export default function DiaryChatPage() {
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
 
   const chatBottomRef = useRef<HTMLDivElement>(null);
+  // Always holds the CURRENT currentConvId, unlike a value captured in a
+  // closure — used to detect if the user switched conversations before an
+  // in-flight /chat response came back.
+  const currentConvIdRef = useRef<string | null>(null);
+  useEffect(() => {
+    currentConvIdRef.current = currentConvId;
+  }, [currentConvId]);
 
   useEffect(() => {
     chatBottomRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -82,32 +89,44 @@ export default function DiaryChatPage() {
     const updatedMessages = [...messages, { role: "user" as const, content: userMsgText }];
     setMessages(updatedMessages);
 
+    const sentToConvId = convId; // the conversation this message actually belongs to
+
     try {
       const data = await api.sendMessage({
-        conversationId: convId,
+        conversationId: sentToConvId,
         message: userMsgText,
         history: historyPayload,
       });
 
-      setMessages((prev) => [
-        ...prev,
-        {
-          role: "assistant",
-          content: data.reply,
-          action: data.action,
-        },
-      ]);
+      // FIX: previously always appended to whatever `messages` was currently
+      // showing — if the user opened a different conversation while this
+      // request was in flight, the reply would visually land in the new
+      // chat instead of the one it was actually sent from. Only update the
+      // visible transcript if still viewing the conversation this reply
+      // belongs to.
+      if (currentConvIdRef.current === sentToConvId) {
+        setMessages((prev) => [
+          ...prev,
+          {
+            role: "assistant",
+            content: data.reply,
+            action: data.action,
+          },
+        ]);
+      }
       setRefreshTick(t => t + 1);
     } catch (err) {
       console.error("Send failed:", err);
-      setMessages((prev) => [
-        ...prev,
-        {
-          role: "assistant",
-          content: "Sorry, my memory systems crossed wires. Let's try that again.",
-          action: "chat",
-        },
-      ]);
+      if (currentConvIdRef.current === sentToConvId) {
+        setMessages((prev) => [
+          ...prev,
+          {
+            role: "assistant",
+            content: "Sorry, my memory systems crossed wires. Let's try that again.",
+            action: "chat",
+          },
+        ]);
+      }
     } finally {
       setLoading(false);
     }
@@ -121,17 +140,10 @@ export default function DiaryChatPage() {
   };
 
   return (
-    // FIX: was `h-screen` with its own internal header — now that the
-    // shared MemoriaHeader lives in app/(protected)/layout.tsx and this page
-    // renders inside that layout's flex-1 area, this should fill whatever
-    // space it's given (`h-full`), not claim the full raw viewport again.
     <div className="relative w-full h-full flex flex-col overflow-hidden text-[#111111] font-serif">
       <div className="absolute inset-0 -z-10 w-full h-full bg-[#148A8F]" />
 
       {/* CORE WORKSPACE SPLIT CONTAINER */}
-      {/* FIX: was h-[calc(100vh-73px)], a hardcoded guess at the old header's
-          height. Now that this page's own header is gone and its parent is a
-          flex column, flex-1 fills exactly what's left, no guessing needed. */}
       <div className="flex flex-1 min-h-0 w-full overflow-hidden relative">
 
         <aside
