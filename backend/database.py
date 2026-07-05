@@ -9,9 +9,8 @@ MONGO_URI = os.getenv("MONGO_URI")
 if not MONGO_URI:
     raise ValueError("MONGO_URI is not set in .env file!")
 
-# Force the database name
 client = AsyncIOMotorClient(MONGO_URI)
-db = client["memoria"]   # ← This is the important line
+db = client["memoria"] 
 
 conversations = db.conversations
 messages = db.messages

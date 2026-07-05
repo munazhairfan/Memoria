@@ -36,11 +36,6 @@ async def register(body: RegisterRequest):
     if existing:
         raise HTTPException(status_code=409, detail="An account with this email already exists")
 
-    # Create the matching Cognee user now, at the same time as our own
-    # account — this is what remember()/recall() will pass as `user=` for
-    # real, physically-isolated storage (see cognee_client.py). We reuse
-    # the same password purely for convenience; we never actually log into
-    # Cognee's own auth system with it, we only need a stable identity.
     cognee_user = await create_cognee_user(body.email, body.password)
 
     result = await users.insert_one({

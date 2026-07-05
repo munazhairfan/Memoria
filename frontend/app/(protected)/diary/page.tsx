@@ -186,7 +186,9 @@ export default function DiaryChatPage() {
 
         <main className="flex-1 flex flex-col items-center justify-between p-4 md:p-6 overflow-hidden h-full relative">
 
-          <div className="absolute inset-0 -z-10">
+          <div className="w-full max-w-4xl h-full flex flex-col bg-white/10 backdrop-blur-md rounded-2xl border border-white/15 shadow-xl overflow-hidden mt-14">
+
+          <section className="absolute inset-0 -z-10">
             <Image
               src="/images/pictures/full_page.png"
               alt="Chat background"
@@ -194,9 +196,7 @@ export default function DiaryChatPage() {
               priority
               className="object-cover opacity-40"
             />
-          </div>
-
-          <div className="w-full max-w-4xl h-full flex flex-col bg-white/10 backdrop-blur-md rounded-2xl border border-white/15 shadow-xl overflow-hidden mt-14">
+          </section>
 
             <div className="flex-1 p-4 overflow-y-auto flex flex-col gap-4">
               {messages.length === 0 && !loading ? (

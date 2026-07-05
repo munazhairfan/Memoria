@@ -152,7 +152,7 @@ const MemoriaPage: NextPage = () => {
               <div className="absolute w-[290px] h-[310px] bg-[#3B7E48] rounded-2xl top-4 md:top-0 right-auto md:right-0 transform translate-x-4 -translate-y-4 shadow-sm"></div>
               <div className="relative w-[290px] h-[310px] bg-white border border-gray-200/60 rounded-2xl shadow-xl p-8 flex flex-col justify-center z-10">
                 <div className="absolute -top-4 left-10 px-4 py-1 bg-amber-50/90 border border-amber-200/50 shadow-sm transform -rotate-6 text-xs text-gray-400 font-sans tracking-widest">
-                  📌 GRAPH
+                  GRAPH
                 </div>
                 <p className="font-sans text-[15px] leading-relaxed text-gray-700 font-normal">
                   Watch your life take shape as a graph. Every person, every feeling, every moment — connected

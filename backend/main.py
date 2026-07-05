@@ -1,5 +1,4 @@
-# CRITICAL: This must be the absolute first import to enforce matching paths across all execution threads!
-# uvicorn backend.main:app --reload
+# run command: uvicorn backend.main:app --reload
 from backend.config import init_config
 init_config()
 from datetime import datetime
@@ -8,7 +7,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
 import uvicorn
-import cognee
 import os
 from backend.cognee_client import remember, recall
 import json as _json
@@ -16,18 +14,13 @@ from pathlib import Path as _Path
 from contextlib import asynccontextmanager
 from backend.routers.conversations import router as conversations_router
 from backend.routers.auth import router as auth_router
-from bson import ObjectId
-from datetime import datetime, timezone
-from backend.database import conversations, messages, users   # Make sure this line exists
+from datetime import datetime
+from backend.database import conversations, messages, users
 from backend.models import ChatRequest
 from backend.auth import get_current_user_id
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup: silently build each registered user's graph from their existing
-    # memories if they don't have one yet. recall() is now scoped to each
-    # user's own Cognee dataset (see cognee_client.py), so this backfill only
-    # ever pulls that user's own memories.
     try:
         async for user in users.find({}):
             uid = str(user["_id"])
@@ -50,7 +43,7 @@ async def lifespan(app: FastAPI):
                 print(f"--> [Startup backfill error for user {uid}]: {e}")
     except Exception as e:
         print(f"--> [Startup backfill error]: {e}")
-    yield  # App runs here
+    yield 
 
 app = FastAPI(
     title="Memoria API",
@@ -83,9 +76,6 @@ class QueryRequest(BaseModel):
 GRAPH_DIR = _Path(__file__).parent / "graphs"
 GRAPH_DIR.mkdir(exist_ok=True)
 
-# FIX: this used to be one hardcoded GRAPH_FILE shared by every user — every
-# user's extracted people/places/events were mixed into a single file that
-# anyone with a valid token could read via /graph. Now scoped per user_id.
 def _graph_file(user_id: str) -> _Path:
     safe_id = "".join(c for c in user_id if c.isalnum() or c in "-_")
     return GRAPH_DIR / f"memory_graph_{safe_id}.json"
@@ -103,15 +93,6 @@ def _save_graph(user_id: str, g: dict):
     _graph_file(user_id).write_text(_json.dumps(g))
 
 def _search_graph_triples(user_id: str, query: str) -> list[str]:
-    # FIX: recall_memory (used by /chat) previously only ever queried
-    # Cognee's live semantic chunk search, which can miss short factual
-    # details (dates, names) that chunk-similarity ranking doesn't surface
-    # well — even when that exact fact is sitting in the graph the user can
-    # see on /memories. Triple extraction already has a fallback to raw
-    # entry text (see _extract_and_store_triples below), which is why the
-    # graph reliably has facts that live chat recall sometimes misses. This
-    # gives chat recall the same safety net: a plain keyword match over the
-    # user's own stored (subject, relationship, object) triples.
     g = _load_graph(user_id)
     STOPWORDS = {"user", "the", "and", "was", "that", "this", "did", "does",
                  "have", "has", "with", "for", "about", "know", "when", "what"}
@@ -131,6 +112,13 @@ async def _extract_and_store_triples(user_id: str, text: str, memories: list[str
         from groq import AsyncGroq
         client = AsyncGroq(api_key=os.environ["LLM_API_KEY"])
 
+        g = _load_graph(user_id)
+        known_entities = list(g["nodes"].keys())
+        known_entities_block = (
+            "\n".join(f"- {e}" for e in known_entities)
+            if known_entities else "(none yet)"
+        )
+
         context = "\n".join(memories) if memories else text
         prompt = f"""Extract knowledge graph triples from the diary entry below.
 
@@ -138,6 +126,10 @@ CRITICAL RULES:
 - ALWAYS capture temporal information: dates, times, "on [date]", "last week", "in June", etc.
 - Create explicit triples linking events to their dates.
 - Use relationship names like: "happened_on", "occurred_on", "scheduled_for", "took_place_in", "mentioned_date".
+- Entities that already exist in the user's memory graph are listed below. If a subject or object refers to the SAME real-world person, thing, or concept as one of these, reuse that EXACT existing wording — do not invent new phrasing for something that already exists. Only create a new label for something genuinely not in this list.
+
+Known entities already in this user's graph:
+{known_entities_block}
 
 Return ONLY a valid JSON array of objects. No explanation, no markdown.
 
@@ -157,10 +149,9 @@ Memory:
                 raw = raw[4:]
         triples = _json.loads(raw.strip())
 
-        g = _load_graph(user_id)
         for t in triples:
             subj = str(t.get("subject", "")).strip()
-            rel  = str(t.get("relationship", "")).strip()
+            rel  = str(t.get("predicate", t.get("relationship", ""))).strip()
             obj  = str(t.get("object", "")).strip()
             if not subj or not rel or not obj:
                 continue
@@ -169,14 +160,19 @@ Memory:
                 g["nodes"][subj] = str(len(g["nodes"]))
             if obj not in g["nodes"]:
                 g["nodes"][obj] = str(len(g["nodes"]))
-            # Add edge
-            g["edges"].append({
-                "source": g["nodes"][subj],
-                "target": g["nodes"][obj],
-                "label": rel,
-                "subj": subj,
-                "obj": obj
-            })
+            # Add edge, skipping exact repeats (e.g. from a re-run or retry)
+            is_duplicate = any(
+                e["subj"] == subj and e["label"] == rel and e["obj"] == obj
+                for e in g["edges"]
+            )
+            if not is_duplicate:
+                g["edges"].append({
+                    "source": g["nodes"][subj],
+                    "target": g["nodes"][obj],
+                    "label": rel,
+                    "subj": subj,
+                    "obj": obj
+                })
         _save_graph(user_id, g)
     except Exception as e:
         print(f"--> [Graph extraction error]: {e}")
@@ -197,15 +193,10 @@ async def create_entry(body: EntryRequest, user_id: str = Depends(get_current_us
         time_anchored_text = f"On {current_date}: {body.text}"
 
         await remember(time_anchored_text, user_id)
-
-        # Extract real triples from this entry and store in graph
         try:
-            memories = await recall(body.text, user_id)
-            memories = list(dict.fromkeys(memories))
-            await _extract_and_store_triples(user_id, time_anchored_text, memories, source_memory=time_anchored_text)
+            await _extract_and_store_triples(user_id, time_anchored_text, [], source_memory=time_anchored_text)
         except Exception as e:
-            # Was a bare `pass` — any failure here (recall() erroring,
-            # extraction failing) was completely invisible, no log at all.
+            #(recall() erroring, extraction failing) was completely invisible, no log at all.
             print(f"--> [/entry graph extraction error] user={user_id}: {e}")
 
         return {"status": "saved"}
@@ -388,14 +379,12 @@ async def chat(body: ChatRequest, user_id: str = Depends(get_current_user_id)):
                 time_anchored_text = f"On {current_date}: {text}"
 
                 await remember(time_anchored_text, user_id)
+                # before extraction, only the brand-new text ever gets
+                # extracted, so old facts stop getting silently re-extracted
+                # (and reworded, and duplicated) on every subsequent message.
                 try:
-                    memories = await recall(text, user_id)
-                    memories = list(dict.fromkeys(memories))
-                    await _extract_and_store_triples(user_id, time_anchored_text, memories, source_memory=time_anchored_text)
+                    await _extract_and_store_triples(user_id, time_anchored_text, [], source_memory=time_anchored_text)
                 except Exception as e:
-                    # Was a bare `except: pass` — completely silent on
-                    # failure. This is the block responsible for updating
-                    # the graph every time something new gets remembered.
                     print(f"--> [/chat remember_entry graph extraction error] user={user_id}: {e}")
 
                 follow_up = messages_list + [
@@ -424,15 +413,10 @@ async def chat(body: ChatRequest, user_id: str = Depends(get_current_user_id)):
                 query = fn_args["query"]
                 results = await recall(query, user_id)
                 graph_hits = _search_graph_triples(user_id, query)
-                # Combine both sources, de-duplicated — the graph catches
-                # specific facts that semantic chunk search sometimes misses.
+        
                 combined = list(dict.fromkeys([*results, *graph_hits]))
                 context = "\n".join(combined) if combined else "No memories found."
 
-                # TEMP DEBUG: remove once recall reliability is confirmed.
-                # Shows exactly what the model searched for and what each
-                # source returned, so a failed lookup can be diagnosed from
-                # the server log instead of guessed at.
                 print(f"🔍 recall_memory query={query!r}")
                 print(f"🔍   cognee results ({len(results)}): {results}")
                 print(f"🔍   graph_hits ({len(graph_hits)}): {graph_hits}")
@@ -464,12 +448,6 @@ async def chat(body: ChatRequest, user_id: str = Depends(get_current_user_id)):
             conv_id = body.conversationId
             db_conv_id = ObjectId(conv_id)
 
-            # FIX: previously this block wrote messages into whatever
-            # conversationId the client sent with zero ownership check — any
-            # authenticated user could pass another user's conversation id
-            # and have their messages saved into it. Verify ownership first,
-            # matching the same rule used in conversations.py, and do it
-            # BEFORE writing anything.
             conv_doc = await conversations.find_one({
                 "_id": db_conv_id,
                 "$or": [
@@ -504,10 +482,6 @@ async def chat(body: ChatRequest, user_id: str = Depends(get_current_user_id)):
                 "updated_at": datetime.now(timezone.utc)
             }
 
-            # FIX: was matching a hardcoded list of placeholder strings
-            # ("New Chat Session" / "New Chat" / "" / None) that never matched
-            # the actual default title ("New Conversation") set in conversations.py,
-            # so the title never got renamed. Use an explicit title_set flag instead.
             if conv_doc and not conv_doc.get("title_set", False):
                 update_payload["title"] = body.message[:25] + "..." if len(body.message) > 25 else body.message
                 update_payload["title_set"] = True
@@ -556,8 +530,38 @@ async def get_history(user_id: str = Depends(get_current_user_id)):
             cleaned_results = results
 
         from fastapi.responses import JSONResponse
+
+        if not cleaned_results:
+            return JSONResponse(
+                content={"history": []},
+                headers={"Cache-Control": "no-store, no-cache", "Pragma": "no-cache"}
+            )
+
+        try:
+            from groq import AsyncGroq
+            client = AsyncGroq(api_key=os.environ.get("LLM_API_KEY"))
+            facts_block = "\n".join(f"- {r}" for r in cleaned_results)
+            summary_prompt = f"""Below are raw facts and memory fragments retrieved from someone's personal diary.
+
+Write a short, warm narrative summary (3-5 sentences) that reads like a friend reflecting on what they know about this person's life — flowing prose, not a list, not bullet points. Only use what's actually in the facts below; don't invent anything.
+
+Facts:
+{facts_block}"""
+            r = await client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[{"role": "user", "content": summary_prompt}],
+                temperature=0.3,
+            )
+            summary = r.choices[0].message.content.strip()
+            final_history = [summary]
+        except Exception as e:
+            print(f"--> [/history summarization error] user={user_id}: {e}")
+            # If summarization itself fails, fall back to the raw facts
+            # rather than showing nothing at all.
+            final_history = cleaned_results
+
         return JSONResponse(
-            content={"history": cleaned_results},
+            content={"history": final_history},
             headers={"Cache-Control": "no-store, no-cache", "Pragma": "no-cache"}
         )
     except Exception as e:
@@ -568,6 +572,5 @@ async def get_history(user_id: str = Depends(get_current_user_id)):
 
 
 # ── Entrypoint ─────────────────────────────────────────────────────────────
-
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)

@@ -7,8 +7,6 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from jose import JWTError, jwt
 from passlib.context import CryptContext
 
-# Requires: pip install "python-jose[cryptography]" "passlib[bcrypt]"
-# Requires: a JWT_SECRET_KEY environment variable set to a long random string.
 
 SECRET_KEY = os.environ.get("JWT_SECRET_KEY")
 if not SECRET_KEY:

@@ -1,8 +1,7 @@
 "use client";
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import Link from "next/link";
-import { useRouter } from "next/navigation";
 import ReactFlow, {
   Node,
   Edge,
@@ -15,7 +14,6 @@ import ReactFlow, {
 } from "reactflow";
 import "reactflow/dist/base.css";
 import { api } from "@/src/api";
-import Header from "@/src/components/Header";
 
 const POSITIONS_KEY = "memoria-graph-positions";
 
@@ -27,9 +25,22 @@ const PALETTE = [
   { bg: "#E0F2F1", text: "#2E7D32" },
 ];
 
+function getCurrentUserId(): string | null {
+  try {
+    const token = localStorage.getItem("token");
+    if (!token) return null;
+    const payload = JSON.parse(atob(token.split(".")[1]));
+    return payload.sub || null;
+  } catch {
+    return null;
+  }
+}
+
 function loadSavedPositions(): Record<string, { x: number; y: number }> {
   try {
-    const raw = localStorage.getItem(POSITIONS_KEY);
+    const uid = getCurrentUserId();
+    const key = uid ? `${POSITIONS_KEY}:${uid}` : POSITIONS_KEY;
+    const raw = localStorage.getItem(key);
     return raw ? JSON.parse(raw) : {};
   } catch {
     return {};
@@ -38,23 +49,20 @@ function loadSavedPositions(): Record<string, { x: number; y: number }> {
 
 function savePositions(nodes: Node[]) {
   try {
+    const uid = getCurrentUserId();
+    const key = uid ? `${POSITIONS_KEY}:${uid}` : POSITIONS_KEY;
     const positions: Record<string, { x: number; y: number }> = {};
     nodes.forEach((n) => { positions[n.id] = n.position; });
-    localStorage.setItem(POSITIONS_KEY, JSON.stringify(positions));
+    localStorage.setItem(key, JSON.stringify(positions));
   } catch {}
 }
 
 export default function MemoriesPage() {
-  const router = useRouter();
   const [nodes, setNodes, onNodesChange] = useNodesState([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState([]);
   const [history, setHistory] = useState<string>("");
   const [loading, setLoading] = useState(true);
-
-  const handleLogout = () => {
-    api.logout();
-    router.push("/login");
-  };
+  const hasFetchedRef = useRef(false);
 
   // Save positions whenever nodes are dragged
   const handleNodesChange = useCallback(
@@ -69,6 +77,9 @@ export default function MemoriesPage() {
   );
 
   useEffect(() => {
+    if (hasFetchedRef.current) return;
+    hasFetchedRef.current = true;
+
     async function fetchData() {
       try {
         const [graphData, historyData] = await Promise.all([
@@ -130,12 +141,6 @@ export default function MemoriesPage() {
         }
 
         if (historyData) {
-          // FIX: previously did `h.history[0]` — only the first memory
-          // snapshot was ever shown, the rest of the returned list was
-          // silently dropped. Also dropped the fragile client-side regex
-          // that re-parsed a raw Cognee object string — the backend's
-          // /history endpoint already returns clean text, so this just
-          // uses it directly.
           const entries = Array.isArray(historyData.history)
             ? historyData.history.filter(Boolean)
             : historyData.history
@@ -155,15 +160,19 @@ export default function MemoriesPage() {
 
   if (loading) {
     return (
-      <div className="min-h-screen w-full flex items-center justify-center bg-[#F6F6F6] font-serif">
+      <div className="h-full w-full flex items-center justify-center bg-[#F6F6F6] font-serif">
         <p className="text-gray-400 text-sm font-sans animate-pulse">Loading your memory graph...</p>
       </div>
     );
   }
 
   return (
-    <div className="min-h-screen bg-[#F6F6F6] flex flex-col font-serif">
-      <Header/>
+    <div className="h-full w-full overflow-y-auto bg-[#F6F6F6] flex flex-col font-serif">
+      <div className="px-6 pt-6">
+        <Link href="/diary" className="text-sm font-sans font-medium text-[#16787C] hover:text-[#115d60] transition">
+          ← Back to Diary
+        </Link>
+      </div>
 
       <div className="w-full h-[65vh] min-h-[420px] relative">
         <h1 className="fraunces text-3xl p-4 pb-4 text-center text-[#111111] hidden sm:block">Your memory, visualized</h1>

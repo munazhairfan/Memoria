@@ -13,10 +13,6 @@ from bson import ObjectId
 init_config()
 
 DEFAULT_DATASET_NAME = "diary"
-# NOTE: no longer need to bake user_id into the dataset name — isolation is
-# now physical (separate storage per Cognee `user`), not a naming
-# convention we have to trust. Every user can safely use the same simple
-# dataset name; Cognee keeps them in genuinely separate storage per user.
 
 
 async def _get_or_create_cognee_user(user_id: str):
@@ -43,10 +39,7 @@ async def _get_or_create_cognee_user(user_id: str):
     if cognee_user_id:
         return await get_user(uuid.UUID(cognee_user_id))
 
-    # Lazy fallback for accounts created before this change — no real
-    # password needed here, we never authenticate through Cognee's own
-    # auth system, we only need a stable `user` identity object to pass
-    # into remember()/recall() for storage isolation.
+    # Lazy fallback for accounts created before this change
     email = mongo_doc["email"]
     try:
         cognee_user = await get_user_by_email(email)
@@ -83,7 +76,6 @@ async def recall(query: str, user_id: str) -> list[str]:
         # A brand-new user who has never called remember() yet has no
         # dataset in Cognee at all — that's not a real error, it just means
         # no memories exist yet. Treat it the same as an empty result
-        # instead of letting it crash /chat, /history, /query.
         if "DatasetNotFoundError" in str(type(e)) or "No datasets found" in str(e):
             return []
         raise

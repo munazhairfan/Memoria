@@ -45,7 +45,6 @@ async def create_conversation(user_id: str = Depends(get_current_user_id)):
 
 @router.get("/{conv_id}")
 async def get_conversation(conv_id: str, user_id: str = Depends(get_current_user_id)):
-    # FIX: enforce the same ownership rule used in the list endpoint, so one
     # user can't fetch another user's conversation by guessing/incrementing an ObjectId.
     conv = await conversations.find_one({
         "_id": ObjectId(conv_id),
@@ -78,9 +77,6 @@ async def delete_conversation(conv_id: str, user_id: str = Depends(get_current_u
         raise HTTPException(status_code=404, detail="Conversation not found")
 
     # 2. Delete all messages tied to this conversation
-    # FIX: messages are stored with an ObjectId conversation_id (see main.py's
-    # /chat handler), but this was querying with the raw string, so it matched
-    # nothing and orphaned every message on delete.
     await messages.delete_many({"conversation_id": ObjectId(conv_id)})
 
     # 3. Delete the conversation record itself
