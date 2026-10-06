@@ -18,9 +18,25 @@ from datetime import datetime
 from backend.database import conversations, messages, users
 from backend.models import ChatRequest
 from backend.auth import get_current_user_id
+from cognee.modules.engine.operations.setup import setup
+
+#==
+
+import os
+print("SYSTEM_ROOT_DIRECTORY:", os.environ.get("SYSTEM_ROOT_DIRECTORY"))
+print("DATA_ROOT_DIRECTORY:", os.environ.get("DATA_ROOT_DIRECTORY"))
+print("exists:", os.path.exists(os.environ.get("DATA_ROOT_DIRECTORY", "")))
+print("writable:", os.access(os.environ.get("DATA_ROOT_DIRECTORY", ""), os.W_OK))
+print("cwd:", os.getcwd())
+
+# ==
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    try:
+        await setup()
+    except Exception as e:
+        print(f"--> [Startup setup error]: {e}")
     try:
         async for user in users.find({}):
             uid = str(user["_id"])
@@ -54,7 +70,10 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "https://memoria-flax-gamma.vercel.app",
+        "http://localhost:3000"
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -137,7 +156,7 @@ Memory:
 {context}"""
 
         r = await client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model=os.environ["LLM_MODEL"],
             messages=[{"role": "user", "content": prompt}],
             temperature=0,
         )
@@ -319,7 +338,7 @@ async def _safe_completion_with_tools(client, messages_list):
     for attempt in range(2):
         try:
             return await client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
+                model=os.environ["LLM_MODEL"],
                 messages=messages_list,
                 tools=TOOLS,
                 tool_choice="auto",
@@ -332,7 +351,7 @@ async def _safe_completion_with_tools(client, messages_list):
 
     print("⚠️ Falling back to a tool-less response after repeated tool_use_failed errors")
     return await client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
+        model=os.environ["LLM_MODEL"],
         messages=messages_list,
         tool_choice="none",
     )
@@ -405,7 +424,7 @@ async def chat(body: ChatRequest, user_id: str = Depends(get_current_user_id)):
                     {"role": "tool", "tool_call_id": tool_id, "name": fn_name, "content": f"Memory saved: {time_anchored_text}"},
                     {"role": "user", "content": "Answer my question conversationally using those memories."}
                 ]
-                r2 = await client.chat.completions.create(model="llama-3.3-70b-versatile", messages=follow_up, temperature=0)
+                r2 = await client.chat.completions.create(model=os.environ["LLM_MODEL"], messages=follow_up, temperature=0)
                 reply = r2.choices[0].message.content
                 action = "remember"
 
@@ -439,7 +458,7 @@ async def chat(body: ChatRequest, user_id: str = Depends(get_current_user_id)):
                     {"role": "tool", "tool_call_id": tool_id, "name": fn_name, "content": context},
                     {"role": "user", "content": "The tool result above contains real facts retrieved from the user's memory — treat them as true and already established, not as something to second-guess. Answer my question directly using them. Only say you don't have the memory if the tool result is literally empty or truly unrelated to what I asked."}
                 ]
-                r2 = await client.chat.completions.create(model="llama-3.3-70b-versatile", messages=follow_up, temperature=0)
+                r2 = await client.chat.completions.create(model=os.environ["LLM_MODEL"], messages=follow_up, temperature=0)
                 reply = r2.choices[0].message.content
                 action = "recall"
 
@@ -548,7 +567,7 @@ Write a short, warm narrative summary (3-5 sentences) that reads like a friend r
 Facts:
 {facts_block}"""
             r = await client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
+                model=os.environ["LLM_MODEL"],
                 messages=[{"role": "user", "content": summary_prompt}],
                 temperature=0.3,
             )
